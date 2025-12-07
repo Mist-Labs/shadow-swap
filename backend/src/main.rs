@@ -1,12 +1,13 @@
+mod api;
 mod config;
+mod crypto;
 mod database;
+mod merkle_tree;
 mod models;
+mod pricefeed;
 mod relay_coordinator;
 mod starknet;
 mod zcash;
-mod api;
-mod crypto;
-mod merkle_tree;
 
 use std::sync::Arc;
 
@@ -15,12 +16,12 @@ use actix_web::{http::header, middleware::Logger, web, App, HttpServer};
 use dotenv::dotenv;
 use tokio::task;
 use tracing::{error, info};
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use crate::{
     config::{config_scope, model::RelayerConfig},
     database::database::Database,
     merkle_tree::model::MerkleTreeManager,
+    pricefeed::pricefeed::PriceCache,
     relay_coordinator::{
         model::{RelayCoordinator, RetryConfig},
         secret_monitor::SecretMonitor,
@@ -37,18 +38,19 @@ pub struct AppState {
     pub zcash_relayer: Arc<ZcashRelayer>,
     pub coordinator: Arc<RelayCoordinator>,
     pub secret_monitor: Arc<SecretMonitor>,
+    pub price_cache: Arc<PriceCache>,
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
 
-    tracing_subscriber::registry()
-        .with(
+    // Initialize logging - FIX: Use simpler initialization
+    tracing_subscriber::fmt()
+        .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "shadow_swap=info,actix_web=info,diesel=warn".into()),
         )
-        .with(tracing_subscriber::fmt::layer())
         .init();
 
     info!("🚀 Starting Shadow Swap Relayer");
@@ -65,6 +67,28 @@ async fn main() -> std::io::Result<()> {
     info!("📊 Running database migrations");
     database.run_migrations().expect("Failed to run migrations");
 
+    info!("💱 Initializing price feeds");
+    let price_cache = Arc::new(PriceCache::new());
+
+    // Initialize STRK -> ZEC price feed
+    info!("📈 Starting STRK->ZEC price feed");
+    let strk_zec_feed = pricefeed::pricefeed::init_price_feed("STRK", "ZEC").await;
+    price_cache.insert_price_data("STRK-ZEC".to_string(), strk_zec_feed);
+
+    // Initialize ZEC -> STRK price feed
+    info!("📈 Starting ZEC->STRK price feed");
+    let zec_strk_feed = pricefeed::pricefeed::init_price_feed("ZEC", "STRK").await;
+    price_cache.insert_price_data("ZEC-STRK".to_string(), zec_strk_feed);
+
+    // Initialize USD price feeds for reference
+    info!("📈 Starting STRK->USD price feed");
+    let strk_usd_feed = pricefeed::pricefeed::init_price_feed("STRK", "USD").await;
+    price_cache.insert_price_data("STRK-USD".to_string(), strk_usd_feed);
+
+    info!("📈 Starting ZEC->USD price feed");
+    let zec_usd_feed = pricefeed::pricefeed::init_price_feed("ZEC", "USD").await;
+    price_cache.insert_price_data("ZEC-USD".to_string(), zec_usd_feed);
+
     info!("🔗 Initializing Starknet relayer");
     let starknet_relayer = Arc::new(
         StarknetRelayer::new(config.starknet.clone(), database.clone())
@@ -74,9 +98,13 @@ async fn main() -> std::io::Result<()> {
 
     info!("🔒 Initializing Zcash relayer");
     let zcash_relayer = Arc::new(ZcashRelayer::new(config.zcash.clone(), database.clone()));
+    zcash_relayer
+        .initialize()
+        .await
+        .expect("Failed to import Zcash relayer private key");
 
     info!("🌳 Initializing Merkle Tree Manager");
-    let tree_depth = 100; 
+    let tree_depth = 20;
     let merkle_tree_manager = Arc::new(MerkleTreeManager::new(
         starknet_relayer.clone(),
         starknet_relayer.clone(),
@@ -98,6 +126,7 @@ async fn main() -> std::io::Result<()> {
             zcash_relayer.clone(),
             database.clone(),
             merkle_tree_manager.clone(),
+            price_cache.clone(),
         )
         .retry_with_config(RetryConfig {
             max_attempts: 5,
@@ -115,6 +144,7 @@ async fn main() -> std::io::Result<()> {
         zcash_relayer,
         coordinator: coordinator.clone(),
         secret_monitor: secret_monitor.clone(),
+        price_cache,
     });
 
     info!("🌳 Starting Merkle Tree Manager service");
@@ -138,16 +168,17 @@ async fn main() -> std::io::Result<()> {
     });
 
     info!("⚙️  Starting coordinator service");
-    let coordinator_handle = task::spawn({
-        let coord = coordinator.clone();
-        async move {
-            if let Err(e) = coord.start().await {
+    let coordinator_clone = coordinator.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            if let Err(e) = coordinator_clone.start().await {
                 error!("❌ Coordinator error: {}", e);
             }
-        }
+        });
     });
 
-    let host = config.server.host;
+    let host = config.server.host.clone();
     let port = config.server.port;
 
     info!("🌐 Starting HTTP server on {}:{}", host, port);
@@ -177,10 +208,11 @@ async fn main() -> std::io::Result<()> {
 
     tokio::select! {
         result = server => error!("HTTP server stopped: {:?}", result),
-        _ = coordinator_handle => error!("Coordinator stopped unexpectedly"),
         _ = monitor_handle => error!("Secret monitor stopped unexpectedly"),
         _ = tree_manager_handle => error!("Merkle Tree Manager stopped unexpectedly"),
     }
 
     Ok(())
 }
+
+// RUST_LOG="debug" cargo run

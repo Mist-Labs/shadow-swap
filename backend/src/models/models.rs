@@ -33,7 +33,7 @@ pub struct HTLCEvent {
     pub event_id: String,
     pub swap_id: String,
     pub event_type: HTLCEventType,
-    pub chain: Chain,
+    pub chain: String,
     pub block_number: u64,
     pub transaction_hash: String,
     pub timestamp: DateTime<Utc>,
@@ -43,20 +43,17 @@ pub struct HTLCEvent {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum HTLCEventType {
     Initiated {
+        hash_lock: String,
+        nullifier: Option<String>,
+        pool_type: String,
         initiator: String,
         participant: String,
-        htlc_address: String,
-        amount: String,
-        timelock: u64,
     },
     Redeemed {
         secret: String,
-        redeemer: String,
-        amount: String,
     },
     Refunded {
-        refunder: String,
-        amount: String,
+        pool_type: String,
     },
 }
 
@@ -94,9 +91,9 @@ pub enum RelayAction {
 
 #[derive(Debug, Deserialize)]
 pub struct InitiateSwapRequest {
-   pub user_address: String,
+    pub user_address: String,
     pub swap_direction: String, // "starknet_to_zcash" or "zcash_to_starknet"
-    pub commitment: String, 
+    pub commitment: String,
     pub hash_lock: String, // SHA256 hash of secret
     pub starknet_amount: String,
     pub zcash_amount: String,
@@ -113,10 +110,10 @@ pub struct InitiateSwapResponse {
 #[derive(Debug, Deserialize)]
 pub struct IndexerEventRequest {
     pub event_type: String, // "htlc_created" | "htlc_redeemed" | "htlc_refunded"
-    pub chain: String, // "starknet" | "zcash"
+    pub chain: String,      // "starknet" | "zcash"
     pub transaction_hash: String,
     pub timestamp: i64,
-
+    pub pool_type: String,
     pub swap_id: Option<String>,
     pub commitment: Option<String>,
     pub nullifier: Option<String>, // For Starknet events
@@ -131,4 +128,54 @@ pub struct IndexerEventResponse {
     pub success: bool,
     pub message: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PriceRequest {
+    pub from_symbol: String,
+    pub to_symbol: String,
+    pub amount: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PriceResponse {
+    pub from_symbol: String,
+    pub to_symbol: String,
+    pub rate: f64,
+    pub amount: Option<f64>,
+    pub converted_amount: Option<f64>,
+    pub timestamp: i64,
+    pub sources: Vec<PriceSourceInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PriceSourceInfo {
+    pub source: String,
+    pub price: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AllPricesResponse {
+    pub strk_to_zec: f64,
+    pub zec_to_strk: f64,
+    pub strk_to_usd: f64,
+    pub zec_to_usd: f64,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ConvertRequest {
+    pub from_symbol: String,
+    pub to_symbol: String,
+    pub amount: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConvertResponse {
+    pub from_symbol: String,
+    pub to_symbol: String,
+    pub input_amount: f64,
+    pub output_amount: f64,
+    pub rate: f64,
+    pub timestamp: i64,
 }

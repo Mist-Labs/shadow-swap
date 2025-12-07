@@ -1,6 +1,6 @@
-use anyhow::{Ok, Result, anyhow};
-use starknet::core::{crypto::compute_hash_on_elements, types::Felt};
+use anyhow::{anyhow, Ok, Result};
 use rand::Rng;
+use starknet::core::{crypto::compute_hash_on_elements, types::Felt};
 
 pub struct PoseidonHasher;
 
@@ -14,17 +14,16 @@ impl PoseidonHasher {
     }
 
     pub fn hash_string(s: &str) -> Result<Felt> {
-        let felt = Felt::from_hex(s)
-            .or_else(|_| {
-                let bytes = s.as_bytes();
-                if bytes.len() > 31 {
-                    return Err(anyhow!("String too long for single Felt"));
-                }
-                let mut padded = [0u8; 32];
-                padded[32 - bytes.len().. ].copy_from_slice(bytes);
-                Ok(Felt::from_bytes_be(&padded))
-            })?;
-            Ok(Self::hash_single(felt))
+        let felt = Felt::from_hex(s).or_else(|_| {
+            let bytes = s.as_bytes();
+            if bytes.len() > 31 {
+                return Err(anyhow!("String too long for single Felt"));
+            }
+            let mut padded = [0u8; 32];
+            padded[32 - bytes.len()..].copy_from_slice(bytes);
+            Ok(Felt::from_bytes_be(&padded))
+        })?;
+        Ok(Self::hash_single(felt))
     }
 
     pub fn generate_hash_lock(secret: &str) -> Result<String> {
@@ -33,10 +32,10 @@ impl PoseidonHasher {
         Ok(format!("0x{:064x}", hash_lock))
     }
 
-        pub fn generate_commitment(amount: &str, blinding_factor: &str) -> Result<String> {
+    pub fn generate_commitment(amount: &str, blinding_factor: &str) -> Result<String> {
         let amount_felt = Felt::from_hex(amount)?;
         let blinding_felt = Felt::from_hex(blinding_factor)?;
-        
+
         let commitment = compute_hash_on_elements(&[amount_felt, blinding_felt]);
         Ok(format!("0x{:064x}", commitment))
     }
@@ -44,12 +43,12 @@ impl PoseidonHasher {
     pub fn generate_nullifier(commitment: &str, secret: &str) -> Result<String> {
         let commitment_felt = Felt::from_hex(commitment)?;
         let secret_felt = Felt::from_hex(secret)?;
-        
+
         let nullifier = compute_hash_on_elements(&[commitment_felt, secret_felt]);
         Ok(format!("0x{:064x}", nullifier))
     }
 
-     pub fn generate_random_felt() -> Felt {
+    pub fn generate_random_felt() -> Felt {
         let mut rng = rand::rng();
         let random_bytes: [u8; 32] = rng.random();
         Felt::from_bytes_be(&random_bytes)
@@ -63,9 +62,7 @@ impl PoseidonHasher {
         padded[32 - bytes.len()..].copy_from_slice(bytes);
         Ok(Felt::from_bytes_be(&padded))
     }
-
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -101,7 +98,7 @@ mod tests {
         let secret = "0x987654321";
         let hash_lock = PoseidonHasher::generate_hash_lock(secret).unwrap();
         assert!(hash_lock.starts_with("0x"));
-        
+
         // Verify it's deterministic
         let hash_lock2 = PoseidonHasher::generate_hash_lock(secret).unwrap();
         assert_eq!(hash_lock, hash_lock2);

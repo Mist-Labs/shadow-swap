@@ -3,20 +3,24 @@
 diesel::table! {
     htlc_events (id) {
         id -> Int4,
-        #[max_length = 66]
+        #[max_length = 255]
         event_id -> Varchar,
-        #[max_length = 66]
-        swap_id -> Varchar,
+        #[max_length = 255]
+        swap_id -> Nullable<Varchar>,
         #[max_length = 20]
         event_type -> Varchar,
         event_data -> Jsonb,
         #[max_length = 20]
         chain -> Varchar,
         block_number -> Int8,
-        #[max_length = 66]
+        #[max_length = 255]
         transaction_hash -> Varchar,
         timestamp -> Timestamptz,
         created_at -> Timestamptz,
+        in_merkle_tree -> Nullable<Bool>,
+        merkle_index -> Nullable<Int4>,
+        #[max_length = 20]
+        pool_type -> Nullable<Varchar>,
     }
 }
 
@@ -96,10 +100,9 @@ diesel::table! {
         state -> Int2,
         created_at -> Timestamptz,
         updated_at -> Timestamptz,
+        htlc_details -> Nullable<Text>,
     }
 }
-
-diesel::joinable!(htlc_events -> swap_pairs (swap_id));
 
 diesel::allow_tables_to_appear_in_same_query!(
     htlc_events,

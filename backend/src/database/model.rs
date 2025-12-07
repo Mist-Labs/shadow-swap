@@ -2,7 +2,10 @@ use chrono::{DateTime, Utc};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::models::schema::{htlc_events, processed_blocks, swap_pairs};
+use crate::{
+    merkle_tree::model::PoolType,
+    models::schema::{htlc_events, processed_blocks, swap_pairs},
+};
 
 // ==================== Swap Pairs ====================
 
@@ -80,7 +83,7 @@ pub struct NewSwapPair<'a> {
 pub struct DbHTLCEvent {
     pub id: i32,
     pub event_id: String,
-    pub swap_id: String,
+    pub swap_id: Option<String>,
     pub event_type: String,
     pub event_data: serde_json::Value,
     pub chain: String,
@@ -88,6 +91,9 @@ pub struct DbHTLCEvent {
     pub transaction_hash: String,
     pub timestamp: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    pub in_merkle_tree: Option<bool>,
+    pub merkle_index: Option<i32>,
+    pub pool_type: Option<String>,
 }
 
 // Insertable struct for HTLC events
@@ -112,8 +118,56 @@ pub struct MerkleDeposit {
     pub pool_type: String,
 }
 
+#[derive(Queryable)]
+pub struct DepositStatusQuery {
+    pub in_merkle_tree: bool,
+    pub merkle_index: Option<i32>,
+    pub pool_type: String,
+}
+
+#[derive(Queryable, Selectable)]
+#[diesel(table_name = crate::models::schema::htlc_events)]
+pub struct DbDepositStatus {
+    pub in_merkle_tree: bool,
+    pub merkle_index: Option<i32>,
+    pub pool_type: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub enum HTLCState {
+    Pending = 0,
+    Redeemed = 1,
+    Refunded = 2,
+}
+
+impl HTLCState {
+    pub fn from_i16(value: i16) -> Self {
+        match value {
+            0 => HTLCState::Pending,
+            1 => HTLCState::Redeemed,
+            2 => HTLCState::Refunded,
+            _ => HTLCState::Pending,
+        }
+    }
+}
 
 // ==================== Processed Blocks ====================
+
+#[derive(Debug, Clone)]
+pub struct PendingDeposit {
+    pub commitment: String,
+    pub token_address: String,
+    pub pool_type: PoolType,
+    pub transaction_hash: String,
+    pub block_number: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DepositStatus {
+    pub in_merkle_tree: bool,
+    pub merkle_index: Option<u32>,
+    pub pool_type: String,
+}
 
 // Queryable struct for processed blocks
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -146,6 +200,7 @@ pub struct DbZcashHTLC {
     pub recipient: String,
     pub amount: f64,
     pub state: i16,
+    pub htlc_details: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

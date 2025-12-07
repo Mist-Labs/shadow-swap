@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use chrono::Utc;
 use diesel::pg::PgConnection;
 use diesel::prelude::*;
@@ -7,13 +8,16 @@ use dotenv::dotenv;
 use tracing::info;
 
 use crate::database::model::{
-    CoordinatorStats, DbSwapPair, MerkleDeposit, NewHTLCEvent, NewSwapPair, NewZcashHTLC, ProcessedBlock, SwapPrivacyParams
+    CoordinatorStats, DbDepositStatus, DbHTLCEvent, DbSwapPair, DbZcashHTLC, DepositStatus,
+    DepositStatusQuery, HTLCState, MerkleDeposit, NewHTLCEvent, NewSwapPair, NewZcashHTLC,
+    PendingDeposit, ProcessedBlock, SwapPrivacyParams,
 };
 use crate::merkle_tree::model::PoolType;
 use crate::models::models::{Chain, HTLCEvent, HTLCEventType, SwapPair, SwapStatus};
 use crate::models::schema::swap_pairs::dsl;
-use crate::models::schema::{htlc_events, processed_blocks, swap_pairs};
-use crate::zcash::indexer::model::{HTLCState, ZcashHTLC};
+use crate::models::schema::{htlc_events, swap_pairs};
+use crate::zcash::model::{ZcashHTLC, ZcashHTLCDetails};
+// use crate::zcash::indexer::model::{HTLCState, ZcashHTLC};
 
 pub const MIGRATIONS: EmbeddedMigrations = embed_migrations!("src/database/migrations");
 
@@ -89,8 +93,7 @@ impl Database {
 
     pub fn get_connection(
         &self,
-    ) -> Result<r2d2::PooledConnection<ConnectionManager<PgConnection>>, Box<dyn std::error::Error>>
-    {
+    ) -> Result<r2d2::PooledConnection<ConnectionManager<PgConnection>>> {
         Ok(self.pool.get()?)
     }
 
@@ -209,11 +212,24 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_swap_status(
-        &self,
-        swap_id: &str,
-        status: SwapStatus,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    // pub fn update_swap_status(
+    //     &self,
+    //     swap_id: &str,
+    //     status: SwapStatus,
+    // ) -> Result<(), Box<dyn std::error::Error>> {
+    //     let mut conn = self.get_connection()?;
+
+    //     diesel::update(dsl::swap_pairs.filter(dsl::id.eq(swap_id)))
+    //         .set((
+    //             dsl::status.eq(status.as_str()),
+    //             dsl::updated_at.eq(Utc::now()),
+    //         ))
+    //         .execute(&mut conn)?;
+
+    //     Ok(())
+    // }
+
+    pub fn update_swap_status(&self, swap_id: &str, status: SwapStatus) -> Result<()> {
         let mut conn = self.get_connection()?;
 
         diesel::update(dsl::swap_pairs.filter(dsl::id.eq(swap_id)))
@@ -221,7 +237,8 @@ impl Database {
                 dsl::status.eq(status.as_str()),
                 dsl::updated_at.eq(Utc::now()),
             ))
-            .execute(&mut conn)?;
+            .execute(&mut conn)
+            .context("Failed to update status for swap")?;
 
         Ok(())
     }
@@ -284,51 +301,73 @@ impl Database {
     }
 
     pub fn get_swap_by_commitment(
-    &self,
-    commitment: &str,
-) -> Result<Option<SwapPair>, Box<dyn std::error::Error>> {
-    let mut conn = self.get_connection()?;
+        &self,
+        commitment: &str,
+    ) -> Result<Option<SwapPair>, Box<dyn std::error::Error>> {
+        let mut conn = self.get_connection()?;
 
-    let result = dsl::swap_pairs
-        .filter(dsl::amount_commitment.eq(commitment))
-        .select(DbSwapPair::as_select())
-        .first::<DbSwapPair>(&mut conn)
-        .optional()?;
+        let result = dsl::swap_pairs
+            .filter(dsl::amount_commitment.eq(commitment))
+            .select(DbSwapPair::as_select())
+            .first::<DbSwapPair>(&mut conn)
+            .optional()?;
 
-    Ok(result.map(db_swap_to_model))
-}
+        Ok(result.map(db_swap_to_model))
+    }
 
-pub fn get_swap_by_nullifier(
-    &self,
-    nullifier: &str,
-) -> Result<Option<SwapPair>, Box<dyn std::error::Error>> {
-    let mut conn = self.get_connection()?;
+    pub fn get_swap_by_nullifier(
+        &self,
+        nullifier: &str,
+    ) -> Result<Option<SwapPair>, Box<dyn std::error::Error>> {
+        let mut conn = self.get_connection()?;
 
-    let result = dsl::swap_pairs
-        .filter(dsl::starknet_htlc_nullifier.eq(nullifier))
-        .select(DbSwapPair::as_select())
-        .first::<DbSwapPair>(&mut conn)
-        .optional()?;
+        let result = dsl::swap_pairs
+            .filter(dsl::starknet_htlc_nullifier.eq(nullifier))
+            .select(DbSwapPair::as_select())
+            .first::<DbSwapPair>(&mut conn)
+            .optional()?;
 
-    Ok(result.map(db_swap_to_model))
-}
+        Ok(result.map(db_swap_to_model))
+    }
 
-pub fn update_starknet_htlc_nullifier(
-    &self,
-    swap_id: &str,
-    nullifier: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut conn = self.get_connection()?;
+    pub fn update_starknet_htlc_nullifier(
+        &self,
+        swap_id: &str,
+        nullifier: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut conn = self.get_connection()?;
 
-    diesel::update(dsl::swap_pairs.filter(dsl::id.eq(swap_id)))
-        .set((
-            dsl::starknet_htlc_nullifier.eq(nullifier),
-            dsl::updated_at.eq(Utc::now()),
-        ))
-        .execute(&mut conn)?;
+        diesel::update(dsl::swap_pairs.filter(dsl::id.eq(swap_id)))
+            .set((
+                dsl::starknet_htlc_nullifier.eq(nullifier),
+                dsl::updated_at.eq(Utc::now()),
+            ))
+            .execute(&mut conn)?;
 
-    Ok(())
-}
+        Ok(())
+    }
+
+    pub fn get_deposit_status(
+        &self,
+        commitment: &str,
+    ) -> Result<Option<DepositStatus>, Box<dyn std::error::Error>> {
+        use crate::models::schema::htlc_events::dsl as he_dsl;
+
+        let mut conn = self.get_connection()?;
+
+        let result = he_dsl::htlc_events
+            .filter(he_dsl::event_type.eq("deposit"))
+            .filter(he_dsl::swap_id.eq(commitment))
+            .select(DbHTLCEvent::as_select())
+            .first::<DbHTLCEvent>(&mut conn)
+            .optional()?;
+
+        Ok(result.map(|r| DepositStatus {
+            in_merkle_tree: r.in_merkle_tree.unwrap_or(false),
+            merkle_index: r.merkle_index.map(|i| i as u32),
+            pool_type: r.pool_type.unwrap_or_else(|| "fast".to_string()),
+        }))
+    }
 
     pub fn get_swap_by_id(
         &self,
@@ -405,11 +444,37 @@ pub fn update_starknet_htlc_nullifier(
         Ok(SwapPrivacyParams::from(swap))
     }
 
-    pub fn add_note_to_swap(
-        &self,
-        swap_id: &str,
-        note: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    // pub fn add_note_to_swap(
+    //     &self,
+    //     swap_id: &str,
+    //     note: &str,
+    // ) -> Result<(), Box<dyn std::error::Error>> {
+    //     let mut conn = self.get_connection()?;
+
+    //     let notes_result: Option<Option<String>> = dsl::swap_pairs
+    //         .filter(dsl::id.eq(swap_id))
+    //         .select(dsl::notes)
+    //         .first::<Option<String>>(&mut conn)
+    //         .optional()?;
+
+    //     let existing_notes: Option<String> = notes_result.flatten();
+
+    //     let timestamp = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    //     let new_note = format!("[{}] {}", timestamp, note);
+
+    //     let updated_notes = match existing_notes {
+    //         Some(old_notes) => format!("{}\n{}", old_notes, new_note),
+    //         None => new_note,
+    //     };
+
+    //     diesel::update(dsl::swap_pairs.filter(dsl::id.eq(swap_id)))
+    //         .set((dsl::notes.eq(updated_notes), dsl::updated_at.eq(Utc::now())))
+    //         .execute(&mut conn)?;
+
+    //     Ok(())
+    // }
+
+    pub fn add_note_to_swap(&self, swap_id: &str, note: &str) -> Result<()> {
         let mut conn = self.get_connection()?;
 
         let notes_result: Option<Option<String>> = dsl::swap_pairs
@@ -430,7 +495,8 @@ pub fn update_starknet_htlc_nullifier(
 
         diesel::update(dsl::swap_pairs.filter(dsl::id.eq(swap_id)))
             .set((dsl::notes.eq(updated_notes), dsl::updated_at.eq(Utc::now())))
-            .execute(&mut conn)?;
+            .execute(&mut conn)
+            .context("Failed to add note")?;
 
         Ok(())
     }
@@ -548,35 +614,42 @@ pub fn update_starknet_htlc_nullifier(
 
     pub fn get_pending_merkle_deposits(
         &self,
-        pool_type:  PoolType,
-    ) -> Result<Vec<MerkleDeposit>, Box<dyn std::error::Error>> {
+        pool_type: PoolType,
+    ) -> Result<Vec<PendingDeposit>, Box<dyn std::error::Error>> {
+        use crate::models::schema::htlc_events::dsl as he_dsl;
+
         let mut conn = self.get_connection()?;
 
-        let pool_name = match pool_type {
+        let pool_str = match pool_type {
             PoolType::Fast => "fast",
             PoolType::Standard => "standard",
         };
 
-        // Get all locked swaps with commitments that haven't been added to merkle tree yet
-        let results = dsl::swap_pairs
-            .filter(dsl::status.eq("locked"))
-            .filter(dsl::amount_commitment.is_not_null())
-            .filter(dsl::token_address.is_not_null())
-            .filter(dsl::notes.not_like(format!("%merkle tree ({}%", pool_name)))
-            .select((dsl::amount_commitment, dsl::token_address, dsl::starknet_amount))
-            .load::<(Option<String>, Option<String>, String)>(&mut conn)?;
+        let results: Vec<(serde_json::Value, String, i64)> = he_dsl::htlc_events
+            .filter(he_dsl::event_type.eq("deposit"))
+            .filter(he_dsl::in_merkle_tree.eq(false))
+            .filter(he_dsl::pool_type.eq(pool_str))
+            .select((
+                he_dsl::event_data,
+                he_dsl::transaction_hash,
+                he_dsl::block_number,
+            ))
+            .load(&mut conn)?;
 
-        let deposits: Vec<MerkleDeposit> = results
-            .into_iter()
-            .filter_map(|(commitment, token, amount)| {
-                Some(MerkleDeposit {
-                    commitment: commitment?,
-                    token_address: token?,
-                    amount,
-                    pool_type: pool_name.to_string(),
-                })
-            })
-            .collect();
+        let mut deposits = Vec::new();
+        let token_address = self.get_default_token_address()?;
+
+        for (event_data, tx_hash, block_num) in results {
+            if let Some(commitment) = event_data.get("commitment").and_then(|c| c.as_str()) {
+                deposits.push(PendingDeposit {
+                    commitment: commitment.to_string(),
+                    token_address: token_address.clone(),
+                    pool_type,
+                    transaction_hash: tx_hash,
+                    block_number: block_num as u64,
+                });
+            }
+        }
 
         Ok(deposits)
     }
@@ -584,28 +657,141 @@ pub fn update_starknet_htlc_nullifier(
     pub fn mark_deposit_in_merkle_tree(
         &self,
         commitment: &str,
-        leaf_index: u32,
-        pool_type:  PoolType,
+        merkle_index: u32,
+        pool_type: PoolType,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let pool_name = match pool_type {
+        use crate::models::schema::htlc_events::dsl as he_dsl;
+
+        let mut conn = self.get_connection()?;
+
+        let pool_str = match pool_type {
             PoolType::Fast => "fast",
             PoolType::Standard => "standard",
         };
 
-        let note = format!("Added to merkle tree ({}): index {}", pool_name, leaf_index);
+        let event_id: String = he_dsl::htlc_events
+            .filter(he_dsl::event_type.eq("deposit"))
+            .filter(he_dsl::pool_type.eq(pool_str))
+            .select(he_dsl::event_id)
+            .first(&mut conn)?;
 
-        let mut conn = self.get_connection()?;
-        let swap_id: Option<String> = dsl::swap_pairs
-            .filter(dsl::amount_commitment.eq(commitment))
-            .select(dsl::id)
-            .first(&mut conn)
-            .optional()?;
+        diesel::update(he_dsl::htlc_events.filter(he_dsl::event_id.eq(&event_id)))
+            .set((
+                he_dsl::in_merkle_tree.eq(true),
+                he_dsl::merkle_index.eq(Some(merkle_index as i32)),
+            ))
+            .execute(&mut conn)?;
 
-        if let Some(id) = swap_id {
-            self.add_note_to_swap(&id, &note)?;
-        }
+        info!(
+            "✅ Marked deposit {} as in merkle tree at index {} for {:?} pool",
+            commitment, merkle_index, pool_type
+        );
 
         Ok(())
+    }
+
+    pub fn insert_deposit_event(
+        &self,
+        commitment: &str,
+        pool_type: PoolType,
+        tx_hash: &str,
+        block_number: u64,
+        timestamp: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::models::schema::htlc_events::dsl;
+
+        info!(
+            "🔍 Attempting to insert deposit event: commitment={}, tx={}",
+            commitment, tx_hash
+        );
+
+        let mut conn = self.get_connection()?;
+
+        let pool_str = match pool_type {
+            PoolType::Fast => "fast",
+            PoolType::Standard => "standard",
+        };
+
+        let event_data = serde_json::json!({
+            "commitment": commitment,
+            "pool_type": pool_str,
+        });
+
+        let dt =
+            chrono::DateTime::from_timestamp(timestamp, 0).unwrap_or_else(|| chrono::Utc::now());
+
+        let result = diesel::insert_into(dsl::htlc_events)
+            .values((
+                dsl::event_id.eq(format!("deposit_{}", tx_hash)),
+                dsl::swap_id.eq(Some(commitment)),
+                dsl::event_type.eq("deposit"),
+                dsl::event_data.eq(event_data),
+                dsl::chain.eq("starknet"),
+                dsl::block_number.eq(block_number as i64),
+                dsl::transaction_hash.eq(tx_hash),
+                dsl::timestamp.eq(dt),
+                dsl::pool_type.eq(Some(pool_str)),
+                dsl::in_merkle_tree.eq(Some(false)),
+                dsl::merkle_index.eq(None::<i32>),
+            ))
+            .execute(&mut conn)?;
+
+        info!("✅ Insert successful! Rows affected: {}", result);
+
+        Ok(())
+    }
+
+    pub fn record_deposit(
+        &self,
+        commitment: &str,
+        pool_type: PoolType,
+        tx_hash: &str,
+        leaf_index: Option<usize>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::models::schema::htlc_events::dsl;
+        let mut conn = self.get_connection()?;
+
+        let pool_str = match pool_type {
+            PoolType::Fast => "fast",
+            PoolType::Standard => "standard",
+        };
+
+        let event_data = serde_json::json!({
+            "commitment": commitment,
+            "leaf_index": leaf_index,
+        });
+
+        diesel::update(dsl::htlc_events.filter(dsl::transaction_hash.eq(tx_hash)))
+            .set((
+                dsl::event_data.eq(event_data),
+                dsl::in_merkle_tree.eq(Some(true)),
+                dsl::merkle_index.eq(leaf_index.map(|i| i as i32)),
+                dsl::pool_type.eq(Some(pool_str)),
+            ))
+            .execute(&mut conn)?;
+
+        Ok(())
+    }
+
+    pub fn get_pending_commitment_count(
+        &self,
+        pool_type: PoolType,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        use crate::models::schema::htlc_events::dsl;
+        let mut conn = self.get_connection()?;
+
+        let pool_str = match pool_type {
+            PoolType::Fast => "fast",
+            PoolType::Standard => "standard",
+        };
+
+        let count = dsl::htlc_events
+            .filter(dsl::pool_type.eq(pool_str))
+            .filter(dsl::in_merkle_tree.eq(Some(true)))
+            .count()
+            .get_result::<i64>(&mut conn)?;
+
+        Ok(count as usize)
     }
 
     pub fn record_merkle_root_update(
@@ -614,15 +800,32 @@ pub fn update_starknet_htlc_nullifier(
         tx_hash: &str,
         pool_type: PoolType,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let pool_name = match pool_type {
-            PoolType::Fast => "Fast",
-            PoolType::Standard => "Standard",
+        use crate::models::schema::htlc_events::dsl;
+        let mut conn = self.get_connection()?;
+
+        let pool_str = match pool_type {
+            PoolType::Fast => "fast",
+            PoolType::Standard => "standard",
         };
 
-        info!(
-            "📝 {} Pool: Recorded merkle root update {} in tx {}",
-            pool_name, root, tx_hash
-        );
+        let event_data = serde_json::json!({
+            "merkle_root": root,
+            "pool_type": pool_str,
+        });
+
+        diesel::insert_into(dsl::htlc_events)
+            .values((
+                dsl::event_id.eq(format!("root_{}", tx_hash)),
+                dsl::swap_id.eq("system"),
+                dsl::event_type.eq("merkle_root_update"),
+                dsl::event_data.eq(event_data),
+                dsl::chain.eq("starknet"),
+                dsl::block_number.eq(0i64),
+                dsl::transaction_hash.eq(tx_hash),
+                dsl::timestamp.eq(Utc::now()),
+                dsl::pool_type.eq(Some(pool_str)),
+            ))
+            .execute(&mut conn)?;
 
         Ok(())
     }
@@ -669,6 +872,57 @@ pub fn update_starknet_htlc_nullifier(
         Ok(())
     }
 
+    pub fn get_htlc_event_by_nullifier(
+        &self,
+        nullifier: &str,
+        event_type: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+        use crate::models::schema::htlc_events::dsl;
+        let mut conn = self.get_connection()?;
+
+        let result = dsl::htlc_events
+            .filter(dsl::swap_id.eq(nullifier))
+            .filter(dsl::event_type.eq(event_type))
+            .filter(dsl::chain.eq("starknet"))
+            .select((dsl::event_data, dsl::transaction_hash))
+            .order(dsl::created_at.desc())
+            .first::<(serde_json::Value, String)>(&mut conn)
+            .optional()?;
+
+        if let Some((mut event_data, tx_hash)) = result {
+            // Add transaction_hash to the event data
+            if let Some(obj) = event_data.as_object_mut() {
+                obj.insert(
+                    "transaction_hash".to_string(),
+                    serde_json::Value::String(tx_hash),
+                );
+            }
+            Ok(Some(event_data))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn get_htlc_event_by_txid(
+        &self,
+        txid: &str,
+        event_type: &str,
+    ) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+        use crate::models::schema::htlc_events::dsl;
+        let mut conn = self.get_connection()?;
+
+        let result = dsl::htlc_events
+            .filter(dsl::transaction_hash.eq(txid))
+            .filter(dsl::event_type.eq(event_type))
+            .filter(dsl::chain.eq("zcash"))
+            .select(dsl::event_data)
+            .order(dsl::created_at.desc())
+            .first::<serde_json::Value>(&mut conn)
+            .optional()?;
+
+        Ok(result)
+    }
+
     pub fn record_zcash_htlc(
         &self,
         txid: &str,
@@ -693,6 +947,67 @@ pub fn update_starknet_htlc_nullifier(
         Ok(())
     }
 
+    pub fn store_zcash_htlc_details(
+        &self,
+        txid: &str,
+        details: &ZcashHTLCDetails,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::models::schema::zcash_htlcs::dsl;
+        let mut conn = self.get_connection()?;
+
+        let details_json = serde_json::to_string(details)?;
+
+        diesel::update(dsl::zcash_htlcs.filter(dsl::txid.eq(txid)))
+            .set((
+                dsl::htlc_details.eq(details_json),
+                dsl::updated_at.eq(Utc::now()),
+            ))
+            .execute(&mut conn)?;
+
+        Ok(())
+    }
+
+    pub fn get_zcash_htlc_by_txid(
+        &self,
+        txid: &str,
+    ) -> Result<ZcashHTLC, Box<dyn std::error::Error>> {
+        use crate::models::schema::zcash_htlcs::dsl;
+        let mut conn = self.get_connection()?;
+
+        let htlc = dsl::zcash_htlcs
+            .filter(dsl::txid.eq(txid))
+            .select(DbZcashHTLC::as_select())
+            .first::<DbZcashHTLC>(&mut conn)?;
+
+        Ok(ZcashHTLC {
+            version: 1,
+            hash_lock: htlc.hash_lock,
+            timelock: htlc.timelock as u64,
+            recipient: htlc.recipient,
+            amount: htlc.amount,
+            state: HTLCState::from_i16(htlc.state),
+        })
+    }
+
+    pub fn get_zcash_htlc_details(
+        &self,
+        txid: &str,
+    ) -> Result<ZcashHTLCDetails, Box<dyn std::error::Error>> {
+        use crate::models::schema::zcash_htlcs::dsl;
+        let mut conn = self.get_connection()?;
+
+        let htlc = dsl::zcash_htlcs
+            .filter(dsl::txid.eq(txid))
+            .select(DbZcashHTLC::as_select())
+            .first::<DbZcashHTLC>(&mut conn)?;
+
+        let details_str = htlc.htlc_details.ok_or_else(|| "HTLC details not found")?;
+
+        let details: ZcashHTLCDetails = serde_json::from_str(&details_str)?;
+
+        Ok(details)
+    }
+
     /// Update Zcash HTLC state
     pub fn update_zcash_htlc_state(
         &self,
@@ -703,19 +1018,15 @@ pub fn update_starknet_htlc_nullifier(
         let mut conn = self.get_connection()?;
 
         diesel::update(dsl::zcash_htlcs.filter(dsl::txid.eq(txid)))
-            .set((
-                dsl::state.eq(state as i16),
-                dsl::updated_at.eq(Utc::now()),
-            ))
+            .set((dsl::state.eq(state as i16), dsl::updated_at.eq(Utc::now())))
             .execute(&mut conn)?;
 
         Ok(())
     }
 
-
     pub fn get_zcash_htlc_by_nullifier(
         &self,
-        nullifier: &str,
+        _nullifier: &str,
     ) -> Result<Option<String>, Box<dyn std::error::Error>> {
         use crate::models::schema::zcash_htlcs::dsl;
         let mut conn = self.get_connection()?;
@@ -755,7 +1066,6 @@ pub fn update_starknet_htlc_nullifier(
 
         Ok(())
     }
-
 
     pub fn get_indexer_checkpoint(
         &self,

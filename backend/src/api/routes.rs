@@ -5,15 +5,17 @@ use tracing::{error, info};
 
 use crate::{
     api::helpers::{
-        determine_pool_type, handle_htlc_created_event, handle_redemption_event,
+        handle_deposit_event, handle_htlc_created_event, handle_redemption_event,
         handle_refund_event, validate_hmac,
     },
     database::model::SwapPrivacyParams,
     merkle_tree::model::PoolType,
     models::models::{
-        IndexerEventRequest, IndexerEventResponse, InitiateSwapRequest, InitiateSwapResponse,
-        SwapPair, SwapStatus,
+        AllPricesResponse, ConvertRequest, ConvertResponse, IndexerEventRequest,
+        IndexerEventResponse, InitiateSwapRequest, InitiateSwapResponse, PriceRequest,
+        PriceResponse, PriceSourceInfo, SwapPair, SwapStatus,
     },
+    pricefeed::pricefeed::get_current_rate,
     AppState,
 };
 
@@ -39,6 +41,8 @@ pub async fn initiate_swap(
         }
     };
 
+    info!("🔄 Initiating swap for commitment: {}", request.commitment);
+
     let swap_id = format!(
         "swap_{}_{}_{}",
         request.swap_direction,
@@ -62,83 +66,135 @@ pub async fn initiate_swap(
         });
     }
 
-    let pool_type = match determine_pool_type(&request.starknet_amount) {
-        Ok(pt) => pt,
-        Err(e) => {
-            return HttpResponse::BadRequest().json(InitiateSwapResponse {
-                success: false,
-                swap_id: swap_id.clone(),
-                message: "Invalid amount".to_string(),
-                error: Some(e),
-            });
-        }
+    // ✅ Only determine pool_type for routing display purposes
+    let token = if request.swap_direction == "starknet_to_zcash" {
+        "STRK"
+    } else {
+        "ZEC"
     };
 
-    let pool_name = match pool_type {
-        PoolType::Fast => "Fast",
-        PoolType::Standard => "Standard",
+    let amount = if request.swap_direction == "starknet_to_zcash" {
+        &request.starknet_amount
+    } else {
+        &request.zcash_amount
     };
 
-    info!(
-        "📊 Routing to {} Pool (<$10K = Fast, ≥$10K = Standard)",
-        pool_name
-    );
+    info!("📊 Routing to Pool (<$10K = Fast, ≥$10K = Standard)");
 
     if request.swap_direction == "starknet_to_zcash" {
         let token_address = app_state.config.starknet.token_address.clone();
+        info!("Token address: {}", token_address);
 
-        let tree_size = app_state
-            .merkle_tree_manager
-            .get_set_size(&token_address, pool_type)
-            .await;
-
-        if tree_size == 0 {
-            return HttpResponse::BadRequest().json(InitiateSwapResponse {
-                success: false,
-                swap_id: swap_id.clone(),
-                message: "No deposits found in pool - user must deposit first".to_string(),
-                error: Some("Call pool.deposit() before initiating swap".to_string()),
-            });
-        }
-
-        // Verify commitment can generate a valid proof (exists in tree)
-        match app_state
-            .merkle_tree_manager
-            .generate_proof(&token_address, &request.commitment, pool_type)
-            .await
-        {
-            Ok(proof) => match app_state.starknet_relayer.get_current_root(pool_type).await {
-                Ok(on_chain_root) => {
-                    if proof.root != on_chain_root {
-                        return HttpResponse::BadRequest().json(InitiateSwapResponse {
-                            success: false,
-                            swap_id: swap_id.clone(),
-                            message: "Merkle tree not synced - please wait for next root update"
-                                .to_string(),
-                            error: Some(format!(
-                                "Local root: {}, On-chain root: {}",
-                                proof.root, on_chain_root
-                            )),
-                        });
-                    }
-                }
-                Err(e) => {
-                    error!("Failed to get on-chain root: {}", e);
-                    return HttpResponse::InternalServerError().json(InitiateSwapResponse {
-                        success: false,
-                        swap_id: swap_id.clone(),
-                        message: "Failed to verify on-chain state".to_string(),
-                        error: Some(e.to_string()),
-                    });
-                }
-            },
+        // ✅ Get deposit status WITHOUT filtering by pool_type
+        let deposit_status = match app_state.database.get_deposit_status(&request.commitment) {
+            Ok(status) => status,
             Err(e) => {
+                error!("Failed to check deposit status: {}", e);
+                return HttpResponse::InternalServerError().json(InitiateSwapResponse {
+                    success: false,
+                    swap_id: swap_id.clone(),
+                    message: "Failed to verify deposit".to_string(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+
+        match deposit_status {
+            None => {
                 return HttpResponse::BadRequest().json(InitiateSwapResponse {
                     success: false,
                     swap_id: swap_id.clone(),
-                    message: "Commitment not found in pool - user must deposit first".to_string(),
-                    error: Some(format!("No valid merkle proof for commitment: {}", e)),
+                    message: "No deposit found - please deposit first".to_string(),
+                    error: Some("Commitment not found in database".to_string()),
                 });
+            }
+            Some(status) if !status.in_merkle_tree => {
+                let actual_pool_type = match status.pool_type.as_str() {
+                    "fast" => PoolType::Fast,
+                    "standard" => PoolType::Standard,
+                    _ => PoolType::Fast,
+                };
+
+                let wait_time = match actual_pool_type {
+                    PoolType::Fast => "30 seconds",
+                    PoolType::Standard => "2 minutes",
+                };
+
+                return HttpResponse::BadRequest().json(InitiateSwapResponse {
+                    success: false,
+                    swap_id: swap_id.clone(),
+                    message: format!(
+                        "Deposit found but Merkle tree is updating. Please wait up to {} and try again.",
+                        wait_time
+                    ),
+                    error: Some("Commitment pending Merkle tree inclusion".to_string()),
+                });
+            }
+            Some(status) => {
+                let pool_type = match status.pool_type.as_str() {
+                    "fast" => PoolType::Fast,
+                    "standard" => PoolType::Standard,
+                    _ => {
+                        error!("❌ Invalid pool_type in database: {}", status.pool_type);
+                        return HttpResponse::InternalServerError().json(InitiateSwapResponse {
+                            success: false,
+                            swap_id: swap_id.clone(),
+                            message: "Internal error - invalid pool type".to_string(),
+                            error: Some(format!("Invalid pool_type: {}", status.pool_type)),
+                        });
+                    }
+                };
+
+                info!("✅ Using {:?} pool from database record", pool_type);
+                info!(
+                    "✅ Deposit found in Merkle tree at index: {:?}",
+                    status.merkle_index
+                );
+
+                match app_state
+                    .merkle_tree_manager
+                    .generate_proof(&token_address, &request.commitment, pool_type)
+                    .await
+                {
+                    Ok(proof) => {
+                        match app_state.starknet_relayer.get_current_root(pool_type).await {
+                            Ok(on_chain_root) => {
+                                if proof.root != on_chain_root {
+                                    return HttpResponse::BadRequest().json(InitiateSwapResponse {
+                                        success: false,
+                                        swap_id: swap_id.clone(),
+                                        message: "Merkle tree not synced - please wait for next root update"
+                                            .to_string(),
+                                        error: Some(format!(
+                                            "Local root: {}, On-chain root: {}",
+                                            proof.root, on_chain_root
+                                        )),
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                error!("Failed to get on-chain root: {}", e);
+                                return HttpResponse::InternalServerError().json(
+                                    InitiateSwapResponse {
+                                        success: false,
+                                        swap_id: swap_id.clone(),
+                                        message: "Failed to verify on-chain state".to_string(),
+                                        error: Some(e.to_string()),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("❌ Failed to generate proof: {}", e);
+                        return HttpResponse::InternalServerError().json(InitiateSwapResponse {
+                            success: false,
+                            swap_id: swap_id.clone(),
+                            message: "Internal error - please contact support".to_string(),
+                            error: Some(format!("Merkle proof generation failed: {}", e)),
+                        });
+                    }
+                }
             }
         }
 
@@ -259,14 +315,161 @@ pub async fn indexer_event(
     );
 
     match request.event_type.as_str() {
-        "htlc_redeemed" => handle_redemption_event(&app_state, &request).await,
+        "deposit" => handle_deposit_event(&app_state, &request).await,
         "htlc_created" => handle_htlc_created_event(&app_state, &request).await,
+        "htlc_redeemed" => handle_redemption_event(&app_state, &request).await,
         "htlc_refunded" => handle_refund_event(&app_state, &request).await,
         _ => HttpResponse::BadRequest().json(IndexerEventResponse {
             success: false,
             message: format!("Unknown event type: {}", request.event_type),
             error: None,
         }),
+    }
+}
+
+#[get("/price")]
+pub async fn get_price(
+    query: web::Query<PriceRequest>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let pair_key = format!(
+        "{}-{}",
+        query.from_symbol.to_uppercase(),
+        query.to_symbol.to_uppercase()
+    );
+
+    info!("📊 Price query for: {}", pair_key);
+
+    match data.price_cache.get_price_data(&pair_key) {
+        Some(price_data) => {
+            let data_guard = match price_data.lock() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    error!("Failed to acquire price data lock: {}", e);
+                    return HttpResponse::InternalServerError().json(json!({
+                        "error": "Failed to acquire price data lock"
+                    }));
+                }
+            };
+
+            if data_guard.price <= 0.0 {
+                return HttpResponse::ServiceUnavailable().json(json!({
+                    "error": "Price data not yet available",
+                    "pair": pair_key
+                }));
+            }
+
+            let converted_amount = query.amount.map(|amt| amt * data_guard.price);
+
+            let response = PriceResponse {
+                from_symbol: query.from_symbol.to_uppercase(),
+                to_symbol: query.to_symbol.to_uppercase(),
+                rate: data_guard.price,
+                amount: query.amount,
+                converted_amount,
+                timestamp: data_guard.timestamp,
+                sources: data_guard
+                    .sources
+                    .iter()
+                    .map(|s| PriceSourceInfo {
+                        source: s.source.clone(),
+                        price: s.price,
+                    })
+                    .collect(),
+            };
+
+            HttpResponse::Ok().json(response)
+        }
+        None => HttpResponse::NotFound().json(json!({
+            "error": "Price feed not found",
+            "pair": pair_key,
+            "available_pairs": ["STRK-ZEC", "ZEC-STRK", "STRK-USD", "ZEC-USD"]
+        })),
+    }
+}
+
+#[get("/prices/all")]
+pub async fn get_all_prices(data: web::Data<AppState>) -> impl Responder {
+    info!("📊 Fetching all prices");
+
+    let mut response = AllPricesResponse {
+        strk_to_zec: 0.0,
+        zec_to_strk: 0.0,
+        strk_to_usd: 0.0,
+        zec_to_usd: 0.0,
+        timestamp: chrono::Utc::now().timestamp(),
+    };
+
+    if let Some(price_data) = data.price_cache.get_price_data("STRK-ZEC") {
+        if let Ok(data_guard) = price_data.lock() {
+            response.strk_to_zec = data_guard.price;
+        }
+    }
+
+    if let Some(price_data) = data.price_cache.get_price_data("ZEC-STRK") {
+        if let Ok(data_guard) = price_data.lock() {
+            response.zec_to_strk = data_guard.price;
+        }
+    }
+
+    if let Some(price_data) = data.price_cache.get_price_data("STRK-USD") {
+        if let Ok(data_guard) = price_data.lock() {
+            response.strk_to_usd = data_guard.price;
+        }
+    }
+
+    if let Some(price_data) = data.price_cache.get_price_data("ZEC-USD") {
+        if let Ok(data_guard) = price_data.lock() {
+            response.zec_to_usd = data_guard.price;
+        }
+    }
+
+    HttpResponse::Ok().json(response)
+}
+
+#[post("/price/convert")]
+pub async fn convert_amount(
+    req: web::Json<ConvertRequest>,
+    data: web::Data<AppState>,
+) -> impl Responder {
+    let pair_key = format!(
+        "{}-{}",
+        req.from_symbol.to_uppercase(),
+        req.to_symbol.to_uppercase()
+    );
+
+    info!(
+        "💱 Convert request: {} {} to {}",
+        req.amount, req.from_symbol, req.to_symbol
+    );
+
+    match data.price_cache.get_price_data(&pair_key) {
+        Some(price_data) => match get_current_rate(price_data) {
+            Ok(rate) => {
+                let output_amount = req.amount * rate;
+
+                let response = ConvertResponse {
+                    from_symbol: req.from_symbol.to_uppercase(),
+                    to_symbol: req.to_symbol.to_uppercase(),
+                    input_amount: req.amount,
+                    output_amount,
+                    rate,
+                    timestamp: chrono::Utc::now().timestamp(),
+                };
+
+                HttpResponse::Ok().json(response)
+            }
+            Err(e) => {
+                error!("Failed to get current rate: {}", e);
+                HttpResponse::ServiceUnavailable().json(json!({
+                    "error": format!("Failed to get exchange rate: {}", e)
+                }))
+            }
+        },
+        None => HttpResponse::NotFound().json(json!({
+            "error": "Price feed not found",
+            "pair": pair_key
+        })),
     }
 }
 
