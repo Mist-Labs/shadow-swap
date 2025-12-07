@@ -1,14 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::RwLock;
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{self, interval, sleep, Duration};
 use tracing::{debug, error, info, warn};
 
 use crate::crypto::poseidon::PoseidonHasher;
 use crate::database::model::SwapPrivacyParams;
 use crate::merkle_tree::model::{MerkleTreeManager, PoolType};
+use crate::pricefeed::pricefeed::{get_current_rate, PriceCache};
 use crate::relay_coordinator::model::{
     RelayCoordinator, RelayMetrics, RetryConfig, SwapDirection, SwapOperationState,
 };
@@ -54,16 +55,18 @@ impl RelayCoordinator {
         zcash_relayer: Arc<ZcashRelayer>,
         database: Arc<Database>,
         merkle_tree_manager: Arc<MerkleTreeManager>,
+        price_cache: Arc<PriceCache>,
     ) -> Self {
         Self {
             starknet_relayer,
             zcash_relayer,
             database,
             merkle_tree_manager,
+            price_cache,
             metrics: Arc::new(RwLock::new(RelayMetrics::default())),
             retry_config: RetryConfig::default(),
             operation_states: Arc::new(RwLock::new(HashMap::new())),
-            start_time: std::time::Instant::now(),
+            start_time: time::Instant::now(),
         }
     }
 
@@ -72,11 +75,64 @@ impl RelayCoordinator {
         self
     }
 
-    pub async fn start(&self) -> Result<()> {
+    /// Convert amount from one currency to another using real-time prices
+    pub fn convert_amount(&self, from_symbol: &str, to_symbol: &str, amount: f64) -> Result<f64> {
+        let pair_key = format!("{}-{}", from_symbol, to_symbol);
+
+        if let Some(price_data) = self.price_cache.get_price_data(&pair_key) {
+            let rate = get_current_rate(price_data)?;
+            let converted = amount * rate;
+
+            info!(
+                "💱 Converting {} {} to {}: {} (rate: {})",
+                amount, from_symbol, to_symbol, converted, rate
+            );
+
+            return Ok(converted);
+        }
+
+        Err(anyhow!(
+            "Price feed not available for {}-{}",
+            from_symbol,
+            to_symbol
+        ))
+    }
+
+    /// Calculate the equivalent amount with slippage protection
+    pub fn calculate_swap_amounts(
+        &self,
+        direction: &SwapDirection,
+        input_amount: f64,
+        slippage_tolerance: f64, // e.g., 0.005 for 0.5%
+    ) -> Result<(f64, f64)> {
+        let (from_symbol, to_symbol) = match direction {
+            SwapDirection::StarknetToZcash => ("STRK", "ZEC"),
+            SwapDirection::ZcashToStarknet => ("ZEC", "STRK"),
+            SwapDirection::Unknown => return Err(anyhow!("Unknown swap direction")),
+        };
+
+        let converted_amount = self.convert_amount(from_symbol, to_symbol, input_amount)?;
+        let minimum_output = converted_amount * (1.0 - slippage_tolerance);
+
+        info!(
+            "📊 Swap calculation: {} {} -> {} {} (minimum: {} with {}% slippage)",
+            input_amount,
+            from_symbol,
+            converted_amount,
+            to_symbol,
+            minimum_output,
+            slippage_tolerance * 100.0
+        );
+
+        Ok((converted_amount, minimum_output))
+    }
+
+    pub async fn start(&self) -> Result<(), String> {
         info!("🎯 Starting relay coordinator");
 
         let metrics = Arc::clone(&self.metrics);
         let start_time = self.start_time;
+
         tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(10));
             loop {
@@ -88,8 +144,9 @@ impl RelayCoordinator {
 
         loop {
             if let Err(e) = self.process_pending_swaps().await {
-                error!("❌ Error processing pending swaps: {}", e);
-                self.record_error(e.to_string()).await;
+                let error_string = e.to_string();
+                error!("❌ Error processing pending swaps: {}", error_string);
+                self.record_error(error_string).await;
             }
 
             sleep(Duration::from_secs(10)).await;
@@ -101,6 +158,11 @@ impl RelayCoordinator {
             .database
             .get_pending_swaps()
             .map_err(|e| anyhow!("Failed to get pending swaps: {}", e))?;
+
+        if pending_swaps.is_empty() {
+            debug!("No pending swaps to process");
+            return Ok(());
+        }
 
         for swap in pending_swaps {
             debug!(
@@ -134,6 +196,14 @@ impl RelayCoordinator {
     async fn handle_initiated_swap(&self, swap: &SwapPair) -> Result<()> {
         let direction = self.determine_swap_direction(swap);
 
+        // Validate amounts using current prices
+        if let Err(e) = self.validate_swap_amounts(swap, &direction).await {
+            warn!("⚠️ Swap amount validation failed for {}: {}", swap.id, e);
+            self.database
+                .add_note_to_swap(&swap.id, &format!("Amount validation warning: {}", e))
+                .ok();
+        }
+
         match direction {
             SwapDirection::StarknetToZcash => {
                 self.handle_starknet_to_zcash(swap).await?;
@@ -149,8 +219,50 @@ impl RelayCoordinator {
         Ok(())
     }
 
+    async fn validate_swap_amounts(
+        &self,
+        swap: &SwapPair,
+        direction: &SwapDirection,
+    ) -> Result<()> {
+        let (input_amount, expected_output, from_symbol, to_symbol) = match direction {
+            SwapDirection::StarknetToZcash => {
+                let input: f64 = swap.starknet_amount.parse()?;
+                let output: f64 = swap.zcash_amount.parse()?;
+                (input, output, "STRK", "ZEC")
+            }
+            SwapDirection::ZcashToStarknet => {
+                let input: f64 = swap.zcash_amount.parse()?;
+                let output: f64 = swap.starknet_amount.parse()?;
+                (input, output, "ZEC", "STRK")
+            }
+            SwapDirection::Unknown => return Err(anyhow!("Unknown direction")),
+        };
+
+        let current_output = self.convert_amount(from_symbol, to_symbol, input_amount)?;
+
+        // Allow 5% deviation (could be due to price movement or fees)
+        let deviation = ((current_output - expected_output) / expected_output).abs();
+
+        if deviation > 0.05 {
+            return Err(anyhow!(
+                "Large price deviation detected: expected {} {}, current market rate gives {} {} ({}% difference)",
+                expected_output,
+                to_symbol,
+                current_output,
+                to_symbol,
+                deviation * 100.0
+            ));
+        }
+
+        Ok(())
+    }
+
     async fn handle_starknet_to_zcash(&self, swap: &SwapPair) -> Result<()> {
         if swap.starknet_htlc_nullifier.is_none() {
+            debug!(
+                "Waiting for Starknet HTLC to be created for swap {}",
+                swap.id
+            );
             return Err(anyhow!("Starknet HTLC not created yet"));
         }
 
@@ -174,8 +286,7 @@ impl RelayCoordinator {
                     &privacy_params.hash_lock,
                     swap.zcash_timelock,
                 )
-                .await
-                .map_err(|e| e.to_string());
+                .await;
 
             match result {
                 Ok(txid) => {
@@ -184,12 +295,14 @@ impl RelayCoordinator {
                         .map_err(|e| anyhow!("Failed to update Zcash txid: {}", e))?;
                     let mut metrics = self.metrics.write().await;
                     metrics.zcash_htlcs_created += 1;
+                    info!("✅ Zcash HTLC created: {}", txid);
                 }
                 Err(e) => {
-                    error!("❌ Failed to create Zcash HTLC: {}", e);
-                    self.mark_swap_failed(&swap.id, &format!("Zcash HTLC creation failed: {}", e))
-                        .await?;
-                    return Err(anyhow!("Zcash HTLC creation failed: {}", e));
+                    let error_string = e.to_string();
+
+                    error!("❌ Failed to create Zcash HTLC: {}", error_string);
+
+                    return self.handle_zcash_htlc_failure(&swap.id, error_string).await;
                 }
             }
         }
@@ -292,13 +405,13 @@ impl RelayCoordinator {
                     info!("✅ Starknet HTLC created: {}", tx_hash);
                 }
                 Err(e) => {
-                    error!("❌ Failed to create Starknet HTLC: {}", e);
-                    self.mark_swap_failed(
-                        &swap.id,
-                        &format!("Starknet HTLC creation failed: {}", e),
-                    )
-                    .await?;
-                    return Err(anyhow!("Starknet HTLC creation failed: {}", e));
+                    let error_msg = e.to_string();
+                    error!("❌ Failed to create Starknet HTLC: {}", error_msg);
+
+                    let fail_reason = format!("Starknet HTLC creation failed: {}", error_msg);
+                    self.mark_swap_failed(&swap.id, &fail_reason).await?;
+
+                    return Err(anyhow!("{}", fail_reason));
                 }
             }
         }
@@ -350,9 +463,27 @@ impl RelayCoordinator {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Secret not available yet"))?;
 
+            // Get HTLC details from database
+            let htlc_txid = swap
+                .zcash_txid
+                .as_ref()
+                .ok_or_else(|| anyhow!("Zcash txid not found"))?;
+
+            let htlc_details = self
+                .database
+                .get_zcash_htlc_details(htlc_txid)
+                .map_err(|e| anyhow!("Failed to get HTLC details: {}", e))?;
+
             let result = self
                 .zcash_relayer
-                .redeem_htlc(zcash_recipient, &swap.zcash_amount, secret)
+                .redeem_htlc(
+                    htlc_txid,                 // htlc_txid
+                    htlc_details.vout,         // vout
+                    zcash_recipient,           // recipient
+                    &swap.zcash_amount,        // amount
+                    secret,                    // secret
+                    &htlc_details.htlc_script, // htlc_script
+                )
                 .await
                 .map_err(|e| e.to_string());
 
@@ -482,15 +613,36 @@ impl RelayCoordinator {
         swap: &SwapPair,
         privacy_params: &SwapPrivacyParams,
     ) -> Result<()> {
-        if let Some(zcash_recipient) = &privacy_params.zcash_recipient {
+        if let Some(_zcash_recipient) = &privacy_params.zcash_recipient {
             let secret = swap
                 .secret
                 .as_ref()
                 .ok_or_else(|| anyhow!("Secret not available yet"))?;
 
+            // Get HTLC details from database
+            let htlc_txid = swap
+                .zcash_txid
+                .as_ref()
+                .ok_or_else(|| anyhow!("Zcash txid not found"))?;
+
+            let htlc_details = self
+                .database
+                .get_zcash_htlc_details(htlc_txid)
+                .map_err(|e| anyhow!("Failed to get HTLC details: {}", e))?;
+
+            // Pool receives the funds
+            let pool_address = &self.zcash_relayer.pool_address.clone();
+
             let result = self
                 .zcash_relayer
-                .redeem_htlc(zcash_recipient, &swap.zcash_amount, secret)
+                .redeem_htlc(
+                    htlc_txid,                 // htlc_txid
+                    htlc_details.vout,         // vout
+                    pool_address,              // recipient (pool gets funds)
+                    &swap.zcash_amount,        // amount
+                    secret,                    // secret
+                    &htlc_details.htlc_script, // htlc_script
+                )
                 .await
                 .map_err(|e| e.to_string());
 
@@ -545,9 +697,20 @@ impl RelayCoordinator {
                 }
             }
             SwapDirection::ZcashToStarknet => {
-                if let Some(zcash_recipient) = &privacy_params.zcash_recipient {
+                if let Some(htlc_txid) = &swap.zcash_txid {
+                    // Get HTLC details from database for refund
+                    let htlc_details = self
+                        .database
+                        .get_zcash_htlc_details(htlc_txid)
+                        .map_err(|e| anyhow!("Failed to get HTLC details: {}", e))?;
+
                     self.zcash_relayer
-                        .refund_htlc(zcash_recipient, &swap.zcash_amount, "timelock_expired")
+                        .refund_htlc(
+                            htlc_txid,
+                            htlc_details.vout,
+                            &swap.zcash_amount,
+                            &htlc_details.htlc_script,
+                        )
                         .await
                         .map_err(|e| anyhow!("Zcash refund failed: {}", e))?;
                 }
@@ -589,19 +752,42 @@ impl RelayCoordinator {
     }
 
     async fn mark_swap_failed(&self, swap_id: &str, reason: &str) -> Result<()> {
-        error!("❌ Marking swap {} as failed: {}", swap_id, reason);
+        let db_clone = self.database.clone();
+        let swap_id_string = swap_id.to_string();
+        let reason_string = reason.to_string();
 
-        self.database
-            .update_swap_status(swap_id, SwapStatus::Failed)
-            .map_err(|e| anyhow!("Failed to update swap status: {}", e))?;
-        self.database
-            .add_note_to_swap(swap_id, reason)
-            .map_err(|e| anyhow!("Failed to add note: {}", e))?;
+        tokio::task::spawn_blocking(move || {
+            db_clone
+                .update_swap_status(&swap_id_string, SwapStatus::Failed)
+                .context("Failed to update swap status")?;
+
+            db_clone
+                .add_note_to_swap(&swap_id_string, &reason_string)
+                .context("Failed to add note")?;
+
+            Ok(()) as anyhow::Result<()>
+        })
+        .await
+        .context("Database blocking task failed/panicked")?
+        .context("Database operation failed")?;
 
         let mut metrics = self.metrics.write().await;
         metrics.failed_swaps += 1;
-
         Ok(())
+    }
+
+    async fn handle_zcash_htlc_failure(
+        &self,
+        swap_id: &str,
+        error_message: String,
+    ) -> anyhow::Result<()> {
+        let fail_reason = format!("Zcash HTLC creation failed: {}", error_message);
+
+        if let Err(mark_err) = self.mark_swap_failed(swap_id, &fail_reason).await {
+            error!("Failed to mark swap as failed: {}", mark_err);
+        }
+
+        Err(anyhow!("{}", fail_reason))
     }
 
     async fn record_error(&self, error: String) {
@@ -620,5 +806,16 @@ impl RelayCoordinator {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Get current exchange rate for display/logging
+    pub fn get_current_exchange_rate(&self, from: &str, to: &str) -> Result<f64> {
+        let pair_key = format!("{}-{}", from, to);
+
+        if let Some(price_data) = self.price_cache.get_price_data(&pair_key) {
+            return get_current_rate(price_data);
+        }
+
+        Err(anyhow!("Exchange rate not available for {}-{}", from, to))
     }
 }

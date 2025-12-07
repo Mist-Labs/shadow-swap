@@ -1,9 +1,6 @@
 use std::collections::HashMap;
 
-use bulletproofs::{BulletproofGens, PedersenGens};
 use serde::{Deserialize, Serialize};
-
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AmountRangeProof {
@@ -12,11 +9,7 @@ pub struct AmountRangeProof {
     pub bit_size: usize,
 }
 
-pub struct RangeProofGenerator {
-    bp_gens: BulletproofGens,
-    pc_gens: PedersenGens,
-}
-
+#[allow(dead_code)]
 pub struct StwoRangeProof {
     pub commitment: String,
     pub proof_data: Vec<u8>,

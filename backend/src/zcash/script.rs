@@ -1,10 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-
 use sha2::{Digest, Sha256};
 
-use crate::zcash::indexer::model::{HTLCState, ZcashHTLC};
+use crate::{database::model::HTLCState, zcash::model::ZcashHTLC};
 
+// use crate::zcash::indexer::model::{HTLCState, ZcashHTLC};
 
 impl ZcashHTLC {
     pub fn new(hash_lock: String, timelock: u64, recipient: String, amount: f64) -> Self {
@@ -63,8 +63,7 @@ impl ZcashHTLC {
         hasher.update(secret.as_bytes());
         let computed_hash = hex::encode(hasher.finalize());
 
-        computed_hash == self.hash_lock ||
-        format!("0x{}", computed_hash) == self.hash_lock
+        computed_hash == self.hash_lock || format!("0x{}", computed_hash) == self.hash_lock
     }
 
     pub fn is_expired(&self) -> bool {
@@ -118,8 +117,6 @@ impl ZcashHTLC {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,12 +159,7 @@ mod tests {
         hasher.update(secret.as_bytes());
         let hash_lock = hex::encode(hasher.finalize());
 
-        let htlc = ZcashHTLC::new(
-            hash_lock,
-            1700000000,
-            "zs1test...".to_string(),
-            1.0,
-        );
+        let htlc = ZcashHTLC::new(hash_lock, 1700000000, "zs1test...".to_string(), 1.0);
 
         assert!(htlc.verify_secret(secret));
         assert!(!htlc.verify_secret("wrong_secret"));
@@ -178,7 +170,8 @@ mod tests {
         let past_timelock = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() - 3600;
+            .as_secs()
+            - 3600;
 
         let htlc = ZcashHTLC::new(
             "hash".to_string(),
@@ -200,14 +193,10 @@ mod tests {
         let future_time = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
-            .as_secs() + 3600;
+            .as_secs()
+            + 3600;
 
-        let htlc = ZcashHTLC::new(
-            hash_lock,
-            future_time,
-            "zs1test...".to_string(),
-            1.0,
-        );
+        let htlc = ZcashHTLC::new(hash_lock, future_time, "zs1test...".to_string(), 1.0);
 
         assert!(htlc.can_redeem(secret).is_ok());
         assert!(htlc.can_refund().is_err());

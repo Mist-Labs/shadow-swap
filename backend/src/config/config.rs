@@ -18,7 +18,7 @@ impl RelayerConfig {
                 port: std::env::var("PORT")
                     .unwrap_or_else(|_| "8080".to_string())
                     .parse()?,
-                hmac_secret: std::env::var("HMAC_SECRET").expect("HMAC secret must be set")
+                hmac_secret: std::env::var("HMAC_SECRET").expect("HMAC secret must be set"),
             },
             database: DatabaseConfig {
                 url: std::env::var("DATABASE_URL")?,
@@ -33,14 +33,22 @@ impl RelayerConfig {
                 owner_address: env::var("OWNER_ADDRESS")?,
                 owner_private_key: env::var("OWNER_PRIVATE_KEY")?,
                 chain_id: env::var("CHAIN_ID")?,
-                token_address: env::var("STARKNET_TOKEN_ADDRESS")?
+                token_address: env::var("STARKNET_TOKEN_ADDRESS")?,
             },
             zcash: ZcashConfig {
+                network: env::var("ZCASH_NETWORK").unwrap_or_else(|_| "testnet".to_string()),
                 rpc_url: std::env::var("ZCASH_RPC_URL")?,
                 rpc_user: std::env::var("ZCASH_RPC_USER")?,
                 rpc_password: std::env::var("ZCASH_RPC_PASSWORD")?,
+                database_url: std::env::var("ZCASH_HTLC_DATABASE_URL")?,
+                database_max_connections: std::env::var("DB_MAX_CONNECTIONS")
+                    .unwrap_or_else(|_| "10".to_string())
+                    .parse()?,
+                explorer_api: std::env::var("ZCASH_EXPLORER_API").ok(),
                 wallet_name: std::env::var("ZCASH_WALLET_NAME").unwrap_or_else(|_| "".to_string()),
-                pool_address: std::env::var("ZCASH_POOL_ADDRESS")?
+                pool_address: std::env::var("ZCASH_POOL_ADDRESS")?,
+                token_address: std::env::var("ZCASH_TOKEN_ADDRESS")?,
+                private_key: std::env::var("ZCASH_PRIVATE_KEY")?,
             },
         })
     }

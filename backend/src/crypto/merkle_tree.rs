@@ -1,12 +1,9 @@
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{anyhow, Ok, Result};
 use rs_merkle::{Hasher, MerkleTree as RsMerkleTree};
 use starknet::core::types::Felt;
 use std::collections::HashMap;
 
-use crate::crypto::{
-    model::{AnonymitySetManager, CommitmentMerkleTree, MembershipProof},
-    poseidon::PoseidonHasher,
-};
+use crate::crypto::model::{AnonymitySetManager, CommitmentMerkleTree, MembershipProof};
 
 #[derive(Clone)]
 pub struct PoseidonMerkleHasher;
@@ -94,7 +91,7 @@ impl CommitmentMerkleTree {
 
     fn rebuild(&mut self) -> Result<()> {
         if self.commitments.is_empty() {
-          let zero_leaf = Felt::ZERO.to_bytes_be();
+            let zero_leaf = Felt::ZERO.to_bytes_be();
             let tree = RsMerkleTree::<PoseidonMerkleHasher>::from_leaves(&[zero_leaf]);
 
             if let Some(root_bytes) = tree.root() {
@@ -440,7 +437,7 @@ mod tests {
         let commitment2_extra =
             "0xbbbb222222222222222222222222222222222222222222222222222222222222";
         tree2.add_commitment(commitment2).unwrap();
-        tree2.add_commitment(commitment2_extra).unwrap(); 
+        tree2.add_commitment(commitment2_extra).unwrap();
 
         let root2 = tree2.get_root().to_string();
         let mut mismatched_tree_proof = valid_proof.clone();

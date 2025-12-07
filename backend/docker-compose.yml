@@ -1,0 +1,36 @@
+services:
+  zcashd:
+    platform: linux/amd64
+    image: electriccoinco/zcashd:latest
+    container_name: veil-zcashd
+    restart: unless-stopped
+    ports:
+      - "18232:18232"  # Testnet RPC port
+      - "18233:18233"  # Testnet P2P port
+    volumes:
+      - zcash_data:/srv/zcashd/.zcash
+      - zcash_params:/srv/zcashd/.zcash-params
+    environment:
+      - ZCASHD_NETWORK=testnet
+      - ZCASHD_RPCUSER=${ZCASH_RPC_USER:-veil_protocol}
+      - ZCASHD_RPCPASSWORD=${ZCASH_RPC_PASSWORD}
+      - ZCASHD_RPCPORT=18232
+      - ZCASHD_RPCBIND=0.0.0.0
+      - ZCASHD_RPCALLOWIP=0.0.0.0/0
+    command: >
+      -testnet
+      -server=1
+      -rpcuser=${ZCASH_RPC_USER:-veil_protocol}
+      -rpcpassword=${ZCASH_RPC_PASSWORD}
+      -rpcport=18232
+      -rpcbind=0.0.0.0
+      -rpcallowip=172.0.0.0/8
+      -rpcallowip=127.0.0.1
+      -txindex=1
+      -allowdeprecated=z_getnewaddress
+
+volumes:
+  zcash_data:
+    driver: local
+  zcash_params:
+    driver: local
